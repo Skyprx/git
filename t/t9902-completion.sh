@@ -5,6 +5,17 @@
 
 test_description='test bash completion'
 
+# The Bash completion scripts must not print anything to either stdout or
+# stderr, which we try to verify. When tracing is enabled without support for
+# BASH_XTRACEFD this assertion will fail, so we have to mark the test as
+# untraceable with such ancient Bash versions.
+test_untraceable=UnfortunatelyYes
+
+# Override environment and always use main for the default initial branch
+# name for these tests, so that rev completion candidates are as expected.
+GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
+export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
+
 . ./lib-bash.sh
 
 complete ()
@@ -62,7 +73,7 @@ _get_comp_words_by_ref ()
 print_comp ()
 {
 	local IFS=$'\n'
-	echo "${COMPREPLY[*]}" > out
+	printf '%s\n' "${COMPREPLY[*]}" > out
 }
 
 run_completion ()
@@ -87,9 +98,11 @@ test_completion ()
 	else
 		sed -e 's/Z$//' |sort >expected
 	fi &&
-	run_completion "$1" &&
+	run_completion "$1" >"$TRASH_DIRECTORY"/bash-completion-output 2>&1 &&
 	sort out >out_sorted &&
-	test_cmp expected out_sorted
+	test_cmp expected out_sorted &&
+	test_must_be_empty "$TRASH_DIRECTORY"/bash-completion-output &&
+	rm "$TRASH_DIRECTORY"/bash-completion-output
 }
 
 # Test __gitcomp.
@@ -136,7 +149,8 @@ fi
 test_expect_success 'setup for __git_find_repo_path/__gitdir tests' '
 	mkdir -p subdir/subsubdir &&
 	mkdir -p non-repo &&
-	git init -b main otherrepo
+	git init -b main otherrepo &&
+	git init -b main slashrepo
 '
 
 test_expect_success '__git_find_repo_path - from command line (through $__git_dir)' '
@@ -442,6 +456,32 @@ test_expect_success '__git_dequote - open double quote' '
 '
 
 
+test_expect_success '__git_count_path_components - no slashes' '
+	echo 1 >expected &&
+	__git_count_path_components a >"$actual" &&
+	test_cmp expected "$actual"
+'
+
+test_expect_success '__git_count_path_components - relative' '
+	echo 3 >expected &&
+	__git_count_path_components a/b/c >"$actual" &&
+	test_cmp expected "$actual"
+
+'
+
+test_expect_success '__git_count_path_components - absolute' '
+	echo 3 >expected &&
+	__git_count_path_components /a/b/c >"$actual" &&
+	test_cmp expected "$actual"
+'
+
+test_expect_success '__git_count_path_components - trailing slash' '
+	echo 3 >expected &&
+	__git_count_path_components a/b/c/ >"$actual" &&
+	test_cmp expected "$actual"
+'
+
+
 test_expect_success '__gitcomp_direct - puts everything into COMPREPLY as-is' '
 	sed -e "s/Z$//g" >expected <<-EOF &&
 	with-trailing-space Z
@@ -550,12 +590,10 @@ test_expect_success '__gitcomp - doesnt fail because of invalid variable name' '
 	__gitcomp "$invalid_variable_name"
 '
 
-read -r -d "" refs <<-\EOF
-main
+refs='main
 maint
 next
-seen
-EOF
+seen'
 
 test_expect_success '__gitcomp_nl - trailing space' '
 	test_gitcomp_nl "m" "$refs" <<-EOF
@@ -635,6 +673,13 @@ test_expect_success 'setup for ref completion' '
 	) &&
 	git remote add other "$ROOT/otherrepo/.git" &&
 	git fetch --no-tags other &&
+	(
+		cd slashrepo &&
+		git commit --allow-empty -m initial &&
+		git branch -m main branch/with/slash
+	) &&
+	git remote add remote/with/slash "$ROOT/slashrepo/.git" &&
+	git fetch --no-tags remote/with/slash &&
 	rm -f .git/FETCH_HEAD &&
 	git init thirdrepo
 '
@@ -644,8 +689,11 @@ test_expect_success '__git_refs - simple' '
 	HEAD
 	main
 	matching-branch
+	other/HEAD
 	other/branch-in-other
 	other/main-in-other
+	remote/with/slash/HEAD
+	remote/with/slash/branch/with/slash
 	matching-tag
 	EOF
 	(
@@ -659,8 +707,11 @@ test_expect_success '__git_refs - full refs' '
 	cat >expected <<-EOF &&
 	refs/heads/main
 	refs/heads/matching-branch
+	refs/remotes/other/HEAD
 	refs/remotes/other/branch-in-other
 	refs/remotes/other/main-in-other
+	refs/remotes/remote/with/slash/HEAD
+	refs/remotes/remote/with/slash/branch/with/slash
 	refs/tags/matching-tag
 	EOF
 	(
@@ -715,12 +766,26 @@ test_expect_success '__git_refs - remote on local file system - full refs' '
 test_expect_success '__git_refs - configured remote' '
 	cat >expected <<-EOF &&
 	HEAD
+	HEAD
 	branch-in-other
 	main-in-other
 	EOF
 	(
 		cur= &&
 		__git_refs other >"$actual"
+	) &&
+	test_cmp expected "$actual"
+'
+
+test_expect_success '__git_refs - configured remote - with slash' '
+	cat >expected <<-EOF &&
+	HEAD
+	HEAD
+	branch/with/slash
+	EOF
+	(
+		cur= &&
+		__git_refs remote/with/slash >"$actual"
 	) &&
 	test_cmp expected "$actual"
 '
@@ -741,6 +806,7 @@ test_expect_success '__git_refs - configured remote - full refs' '
 
 test_expect_success '__git_refs - configured remote - repo given on the command line' '
 	cat >expected <<-EOF &&
+	HEAD
 	HEAD
 	branch-in-other
 	main-in-other
@@ -772,6 +838,7 @@ test_expect_success '__git_refs - configured remote - full refs - repo given on 
 
 test_expect_success '__git_refs - configured remote - remote name matches a directory' '
 	cat >expected <<-EOF &&
+	HEAD
 	HEAD
 	branch-in-other
 	main-in-other
@@ -861,19 +928,23 @@ test_expect_success '__git_refs - unique remote branches for git checkout DWIMer
 	HEAD
 	main
 	matching-branch
+	other/HEAD
 	other/ambiguous
 	other/branch-in-other
 	other/main-in-other
-	remote/ambiguous
-	remote/branch-in-remote
+	remote/with/slash/HEAD
+	remote/with/slash/ambiguous
+	remote/with/slash/branch-in-remote
+	remote/with/slash/branch/with/slash
 	matching-tag
 	branch-in-other
 	branch-in-remote
+	branch/with/slash
 	main-in-other
 	EOF
 	for remote_ref in refs/remotes/other/ambiguous \
-		refs/remotes/remote/ambiguous \
-		refs/remotes/remote/branch-in-remote
+		refs/remotes/remote/with/slash/ambiguous \
+		refs/remotes/remote/with/slash/branch-in-remote
 	do
 		git update-ref $remote_ref main &&
 		test_when_finished "git update-ref -d $remote_ref" || return 1
@@ -890,8 +961,11 @@ test_expect_success '__git_refs - after --opt=' '
 	HEAD
 	main
 	matching-branch
+	other/HEAD
 	other/branch-in-other
 	other/main-in-other
+	remote/with/slash/HEAD
+	remote/with/slash/branch/with/slash
 	matching-tag
 	EOF
 	(
@@ -905,8 +979,11 @@ test_expect_success '__git_refs - after --opt= - full refs' '
 	cat >expected <<-EOF &&
 	refs/heads/main
 	refs/heads/matching-branch
+	refs/remotes/other/HEAD
 	refs/remotes/other/branch-in-other
 	refs/remotes/other/main-in-other
+	refs/remotes/remote/with/slash/HEAD
+	refs/remotes/remote/with/slash/branch/with/slash
 	refs/tags/matching-tag
 	EOF
 	(
@@ -921,8 +998,11 @@ test_expect_success '__git refs - excluding refs' '
 	^HEAD
 	^main
 	^matching-branch
+	^other/HEAD
 	^other/branch-in-other
 	^other/main-in-other
+	^remote/with/slash/HEAD
+	^remote/with/slash/branch/with/slash
 	^matching-tag
 	EOF
 	(
@@ -936,8 +1016,11 @@ test_expect_success '__git refs - excluding full refs' '
 	cat >expected <<-EOF &&
 	^refs/heads/main
 	^refs/heads/matching-branch
+	^refs/remotes/other/HEAD
 	^refs/remotes/other/branch-in-other
 	^refs/remotes/other/main-in-other
+	^refs/remotes/remote/with/slash/HEAD
+	^refs/remotes/remote/with/slash/branch/with/slash
 	^refs/tags/matching-tag
 	EOF
 	(
@@ -961,9 +1044,12 @@ test_expect_success '__git_refs - do not filter refs unless told so' '
 	main
 	matching-branch
 	matching/branch
+	other/HEAD
 	other/branch-in-other
 	other/main-in-other
 	other/matching/branch-in-other
+	remote/with/slash/HEAD
+	remote/with/slash/branch/with/slash
 	matching-tag
 	matching/tag
 	EOF
@@ -1081,8 +1167,11 @@ test_expect_success '__git_complete_refs - simple' '
 	HEAD Z
 	main Z
 	matching-branch Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	matching-tag Z
 	EOF
 	(
@@ -1109,6 +1198,7 @@ test_expect_success '__git_complete_refs - matching' '
 test_expect_success '__git_complete_refs - remote' '
 	sed -e "s/Z$//" >expected <<-EOF &&
 	HEAD Z
+	HEAD Z
 	branch-in-other Z
 	main-in-other Z
 	EOF
@@ -1120,15 +1210,33 @@ test_expect_success '__git_complete_refs - remote' '
 	test_cmp expected out
 '
 
+test_expect_success '__git_complete_refs - remote - with slash' '
+	sed -e "s/Z$//" >expected <<-EOF &&
+	HEAD Z
+	HEAD Z
+	branch/with/slash Z
+	EOF
+	(
+		cur= &&
+		__git_complete_refs --remote=remote/with/slash &&
+		print_comp
+	) &&
+	test_cmp expected out
+'
+
 test_expect_success '__git_complete_refs - track' '
 	sed -e "s/Z$//" >expected <<-EOF &&
 	HEAD Z
 	main Z
 	matching-branch Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	matching-tag Z
 	branch-in-other Z
+	branch/with/slash Z
 	main-in-other Z
 	EOF
 	(
@@ -1170,8 +1278,11 @@ test_expect_success '__git_complete_refs - suffix' '
 	HEAD.
 	main.
 	matching-branch.
+	other/HEAD.
 	other/branch-in-other.
 	other/main-in-other.
+	remote/with/slash/HEAD.
+	remote/with/slash/branch/with/slash.
 	matching-tag.
 	EOF
 	(
@@ -1185,12 +1296,27 @@ test_expect_success '__git_complete_refs - suffix' '
 test_expect_success '__git_complete_fetch_refspecs - simple' '
 	sed -e "s/Z$//" >expected <<-EOF &&
 	HEAD:HEAD Z
+	HEAD:HEAD Z
 	branch-in-other:branch-in-other Z
 	main-in-other:main-in-other Z
 	EOF
 	(
 		cur= &&
 		__git_complete_fetch_refspecs other &&
+		print_comp
+	) &&
+	test_cmp expected out
+'
+
+test_expect_success '__git_complete_fetch_refspecs - with slash' '
+	sed -e "s/Z$//" >expected <<-EOF &&
+	HEAD:HEAD Z
+	HEAD:HEAD Z
+	branch/with/slash:branch/with/slash Z
+	EOF
+	(
+		cur= &&
+		__git_complete_fetch_refspecs remote/with/slash &&
 		print_comp
 	) &&
 	test_cmp expected out
@@ -1210,6 +1336,7 @@ test_expect_success '__git_complete_fetch_refspecs - matching' '
 
 test_expect_success '__git_complete_fetch_refspecs - prefix' '
 	sed -e "s/Z$//" >expected <<-EOF &&
+	+HEAD:HEAD Z
 	+HEAD:HEAD Z
 	+branch-in-other:branch-in-other Z
 	+main-in-other:main-in-other Z
@@ -1250,25 +1377,189 @@ test_expect_success '__git_complete_fetch_refspecs - fully qualified & prefix' '
 	test_cmp expected out
 '
 
+test_expect_success '__git_complete_worktree_paths' '
+	test_when_finished "git worktree remove other_wt" &&
+	git worktree add --orphan other_wt &&
+	run_completion "git worktree remove " &&
+	test_grep other_wt out
+'
+
+test_expect_success '__git_complete_worktree_paths - not a git repository' '
+	(
+		cd non-repo &&
+		GIT_CEILING_DIRECTORIES="$ROOT" &&
+		export GIT_CEILING_DIRECTORIES &&
+		test_completion "git worktree remove " ""
+	)
+'
+
+test_expect_success '__git_complete_worktree_paths with -C' '
+	test_when_finished "git -C otherrepo worktree remove otherrepo_wt" &&
+	git -C otherrepo worktree add --orphan otherrepo_wt &&
+	run_completion "git -C otherrepo worktree remove " &&
+	test_grep otherrepo_wt out
+'
+
 test_expect_success 'git switch - with no options, complete local branches and unique remote branch names for DWIM logic' '
 	test_completion "git switch " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
 	EOF
 '
 
+test_expect_success 'git bisect - when not bisecting, complete only replay and start subcommands' '
+	test_completion "git bisect " <<-\EOF
+	replay Z
+	start Z
+	EOF
+'
+
+test_expect_success 'git bisect - complete options to start subcommand' '
+	test_completion "git bisect start --" <<-\EOF
+	--term-new Z
+	--term-bad Z
+	--term-old Z
+	--term-good Z
+	--no-checkout Z
+	--first-parent Z
+	EOF
+'
+
+test_expect_success 'setup for git-bisect tests requiring a repo' '
+	git init git-bisect &&
+	(
+		cd git-bisect &&
+		echo "initial contents" >file &&
+		git add file &&
+		git commit -am "Initial commit" &&
+		git tag initial &&
+		echo "new line" >>file &&
+		git commit -am "First change" &&
+		echo "another new line" >>file &&
+		git commit -am "Second change" &&
+		git tag final
+	)
+'
+
+test_expect_success 'git bisect - start subcommand arguments before double-dash are completed as revs' '
+	(
+		cd git-bisect &&
+		test_completion "git bisect start " <<-\EOF
+		HEAD Z
+		final Z
+		initial Z
+		main Z
+		EOF
+	)
+'
+
+# Note that these arguments are <pathspec>s, which in practice the fallback
+# completion (not the git completion) later ends up completing as paths.
+test_expect_success 'git bisect - start subcommand arguments after double-dash are not completed' '
+	(
+		cd git-bisect &&
+		test_completion "git bisect start final initial -- " ""
+	)
+'
+
+test_expect_success 'setup for git-bisect tests requiring ongoing bisection' '
+	(
+		cd git-bisect &&
+		git bisect start --term-new=custom_new --term-old=custom_old final initial
+	)
+'
+
+test_expect_success 'git-bisect - when bisecting all subcommands are candidates' '
+	(
+		cd git-bisect &&
+		test_completion "git bisect " <<-\EOF
+		start Z
+		bad Z
+		custom_new Z
+		custom_old Z
+		new Z
+		good Z
+		old Z
+		terms Z
+		skip Z
+		reset Z
+		visualize Z
+		replay Z
+		log Z
+		run Z
+		help Z
+		EOF
+	)
+'
+
+test_expect_success 'git-bisect - options to terms subcommand are candidates' '
+	(
+		cd git-bisect &&
+		test_completion "git bisect terms --" <<-\EOF
+		--term-bad Z
+		--term-good Z
+		--term-new Z
+		--term-old Z
+		EOF
+	)
+'
+
+test_expect_success 'git-bisect - git-log options to visualize subcommand are candidates' '
+	(
+		cd git-bisect &&
+		# The completion used for git-log and here does not complete
+		# every git-log option, so rather than hope to stay in sync
+		# with exactly what it does we will just spot-test here.
+		test_completion "git bisect visualize --sta" <<-\EOF &&
+		--stat Z
+		EOF
+		test_completion "git bisect visualize --summar" <<-\EOF
+		--summary Z
+		EOF
+	)
+'
+
+test_expect_success 'git-bisect - view subcommand is not a candidate' '
+	(
+		cd git-bisect &&
+		test_completion "git bisect vi" <<-\EOF
+		visualize Z
+		EOF
+	)
+'
+
+test_expect_success 'git-bisect - existing view subcommand is recognized and enables completion of git-log options' '
+	(
+		cd git-bisect &&
+		# The completion used for git-log and here does not complete
+		# every git-log option, so rather than hope to stay in sync
+		# with exactly what it does we will just spot-test here.
+		test_completion "git bisect view --sta" <<-\EOF &&
+		--stat Z
+		EOF
+		test_completion "git bisect view --summar" <<-\EOF
+		--summary Z
+		EOF
+	)
+'
+
 test_expect_success 'git checkout - completes refs and unique remote branches for DWIM' '
 	test_completion "git checkout " <<-\EOF
 	HEAD Z
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1289,6 +1580,7 @@ test_expect_success 'git switch - with GIT_COMPLETION_CHECKOUT_NO_GUESS=1, compl
 test_expect_success 'git switch - --guess overrides GIT_COMPLETION_CHECKOUT_NO_GUESS=1, complete local branches and unique remote names for DWIM logic' '
 	GIT_COMPLETION_CHECKOUT_NO_GUESS=1 test_completion "git switch --guess " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1298,6 +1590,7 @@ test_expect_success 'git switch - --guess overrides GIT_COMPLETION_CHECKOUT_NO_G
 test_expect_success 'git switch - a later --guess overrides previous --no-guess, complete local and remote unique branches for DWIM' '
 	test_completion "git switch --no-guess --guess " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1317,8 +1610,11 @@ test_expect_success 'git checkout - with GIT_COMPLETION_NO_GUESS=1 only complete
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1326,12 +1622,16 @@ test_expect_success 'git checkout - --guess overrides GIT_COMPLETION_NO_GUESS=1,
 	GIT_COMPLETION_CHECKOUT_NO_GUESS=1 test_completion "git checkout --guess " <<-\EOF
 	HEAD Z
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1341,8 +1641,11 @@ test_expect_success 'git checkout - with --no-guess, only completes refs' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1350,12 +1653,16 @@ test_expect_success 'git checkout - a later --guess overrides previous --no-gues
 	test_completion "git checkout --no-guess --guess " <<-\EOF
 	HEAD Z
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1365,8 +1672,11 @@ test_expect_success 'git checkout - a later --no-guess overrides previous --gues
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1377,8 +1687,11 @@ test_expect_success 'git checkout - with checkout.guess = false, only completes 
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1387,12 +1700,16 @@ test_expect_success 'git checkout - with checkout.guess = true, completes refs a
 	test_completion "git checkout " <<-\EOF
 	HEAD Z
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1401,12 +1718,16 @@ test_expect_success 'git checkout - a later --guess overrides previous checkout.
 	test_completion "git checkout --guess " <<-\EOF
 	HEAD Z
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1417,8 +1738,11 @@ test_expect_success 'git checkout - a later --no-guess overrides previous checko
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1428,8 +1752,11 @@ test_expect_success 'git switch - with --detach, complete all references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1439,8 +1766,11 @@ test_expect_success 'git checkout - with --detach, complete only references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1610,8 +1940,11 @@ test_expect_success 'git switch - with -d, complete all references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1621,30 +1954,45 @@ test_expect_success 'git checkout - with -d, complete only references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
 test_expect_success 'git switch - with --track, complete only remote branches' '
 	test_completion "git switch --track " <<-\EOF &&
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 	test_completion "git switch -t " <<-\EOF
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
 test_expect_success 'git checkout - with --track, complete only remote branches' '
 	test_completion "git checkout --track " <<-\EOF &&
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 	test_completion "git checkout -t " <<-\EOF
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1661,8 +2009,11 @@ test_expect_success 'git checkout - with --no-track, complete only local referen
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1672,8 +2023,11 @@ test_expect_success 'git switch - with -c, complete all references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1683,8 +2037,11 @@ test_expect_success 'git switch - with -C, complete all references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1694,8 +2051,11 @@ test_expect_success 'git switch - with -c and --track, complete all references' 
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1705,8 +2065,11 @@ test_expect_success 'git switch - with -C and --track, complete all references' 
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1716,8 +2079,11 @@ test_expect_success 'git switch - with -c and --no-track, complete all reference
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1727,8 +2093,11 @@ test_expect_success 'git switch - with -C and --no-track, complete all reference
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1738,8 +2107,11 @@ test_expect_success 'git checkout - with -b, complete all references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1749,8 +2121,11 @@ test_expect_success 'git checkout - with -B, complete all references' '
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1760,8 +2135,11 @@ test_expect_success 'git checkout - with -b and --track, complete all references
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1771,8 +2149,11 @@ test_expect_success 'git checkout - with -B and --track, complete all references
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1782,8 +2163,11 @@ test_expect_success 'git checkout - with -b and --no-track, complete all referen
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
@@ -1793,14 +2177,18 @@ test_expect_success 'git checkout - with -B and --no-track, complete all referen
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
 	EOF
 '
 
 test_expect_success 'git switch - for -c, complete local branches and unique remote branches' '
 	test_completion "git switch -c " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1810,6 +2198,7 @@ test_expect_success 'git switch - for -c, complete local branches and unique rem
 test_expect_success 'git switch - for -C, complete local branches and unique remote branches' '
 	test_completion "git switch -C " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1847,6 +2236,7 @@ test_expect_success 'git switch - for -C with --no-track, complete local branche
 test_expect_success 'git checkout - for -b, complete local branches and unique remote branches' '
 	test_completion "git checkout -b " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1856,6 +2246,7 @@ test_expect_success 'git checkout - for -b, complete local branches and unique r
 test_expect_success 'git checkout - for -B, complete local branches and unique remote branches' '
 	test_completion "git checkout -B " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1893,6 +2284,7 @@ test_expect_success 'git checkout - for -B with --no-track, complete local branc
 test_expect_success 'git switch - with --orphan completes local branch names and unique remote branch names' '
 	test_completion "git switch --orphan " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1908,6 +2300,7 @@ test_expect_success 'git switch - --orphan with branch already provided complete
 test_expect_success 'git checkout - with --orphan completes local branch names and unique remote branch names' '
 	test_completion "git checkout --orphan " <<-\EOF
 	branch-in-other Z
+	branch/with/slash Z
 	main Z
 	main-in-other Z
 	matching-branch Z
@@ -1920,15 +2313,27 @@ test_expect_success 'git checkout - --orphan with branch already provided comple
 	main Z
 	matching-branch Z
 	matching-tag Z
+	other/HEAD Z
 	other/branch-in-other Z
 	other/main-in-other Z
+	remote/with/slash/HEAD Z
+	remote/with/slash/branch/with/slash Z
+	EOF
+'
+
+test_expect_success 'git restore completes modified files' '
+	test_commit A a.file &&
+	echo B >a.file &&
+	test_completion "git restore a." <<-\EOF
+	a.file
 	EOF
 '
 
 test_expect_success 'teardown after ref completion' '
 	git branch -d matching-branch &&
 	git tag -d matching-tag &&
-	git remote remove other
+	git remote remove other &&
+	git remote remove remote/with/slash
 '
 
 
@@ -2039,7 +2444,7 @@ test_expect_success FUNNYNAMES \
 	>repeated-quoted/2-file &&
 	>repeated-quoted/3\"file &&   # ... and here, too.
 
-	# Still, we shold only list the directory name only once.
+	# Still, we should list the directory name only once.
 	test_path_completion repeated repeated-quoted
 '
 
@@ -2149,14 +2554,14 @@ test_expect_success '__git_pretty_aliases' '
 test_expect_success 'basic' '
 	run_completion "git " &&
 	# built-in
-	grep -q "^add \$" out &&
+	test_grep -q "^add \$" out &&
 	# script
-	grep -q "^rebase \$" out &&
+	test_grep -q "^rebase \$" out &&
 	# plumbing
-	! grep -q "^ls-files \$" out &&
+	test_grep ! -q "^ls-files \$" out &&
 
 	run_completion "git r" &&
-	! grep -q -v "^r" out
+	test_grep ! -q -v "^r" out
 '
 
 test_expect_success 'double dash "git" itself' '
@@ -2189,9 +2594,12 @@ test_expect_success 'double dash "git checkout"' '
 	--merge Z
 	--conflict=Z
 	--patch Z
+	--unified=Z
+	--inter-hunk-context=Z
 	--ignore-skip-worktree-bits Z
 	--ignore-other-worktrees Z
 	--recurse-submodules Z
+	--auto-advance Z
 	--progress Z
 	--guess Z
 	--no-guess Z
@@ -2248,13 +2656,15 @@ test_expect_success 'git --help completion' '
 test_expect_success 'completion.commands removes multiple commands' '
 	test_config completion.commands "-cherry -mergetool" &&
 	git --list-cmds=list-mainporcelain,list-complete,config >out &&
-	! grep -E "^(cherry|mergetool)$" out
+	test_grep ! -E "^(cherry|mergetool)$" out
 '
 
 test_expect_success 'setup for integration tests' '
 	echo content >file1 &&
 	echo more >file2 &&
 	git add file1 file2 &&
+	echo untracked >file3 &&
+	echo untracked >ufile &&
 	git commit -m one &&
 	git branch mybranch &&
 	git tag mytag
@@ -2304,6 +2714,118 @@ test_expect_success 'git -C <path> checkout uses the right repo' '
 	EOF
 '
 
+test_expect_success 'git checkout completes tracked paths when no refs match' '
+	# file1 and file2 are tracked but file3 is not
+	# there is no ref that begins with f
+	test_completion "git checkout f" <<-\EOF &&
+	file1
+	file2
+	EOF
+	test_completion "git checkout -- f" <<-\EOF
+	file1
+	file2
+	EOF
+'
+
+test_expect_success 'git checkout completes untracked paths, too' '
+	# ufile is not tracked and there is no ref that begins with u
+	test_completion "git checkout u" <<-\EOF &&
+	ufile
+	EOF
+	test_completion "git checkout -- u" <<-\EOF
+	ufile
+	EOF
+'
+
+test_expect_success 'git -C <path> checkout completes paths in specified repo' '
+	# otherfile is tracked, oops is not
+	# lostfile is tracked but lost, ufile is untracked.
+	test_when_finished "rm -rf repo-for-checkout" &&
+	git init repo-for-checkout &&
+	echo content >repo-for-checkout/otherfile &&
+	echo content >repo-for-checkout/lostfile &&
+	git -C repo-for-checkout add otherfile &&
+	git -C repo-for-checkout add lostfile &&
+	git -C repo-for-checkout commit -m otherfile &&
+	echo untracked >repo-for-checkout/oops &&
+	echo untracked >repo-for-checkout/ufile &&
+	rm -f repo-for-checkout/lostfile &&
+	test_completion "git -C repo-for-checkout checkout o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout -- o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout -- l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-checkout checkout u" <<-\EOF &&
+	ufile
+	EOF
+	test_completion "git -C repo-for-checkout checkout -- u" <<-\EOF
+	ufile
+	EOF
+'
+
+test_expect_success 'git diff completes tracked paths when no refs match' '
+	# file1 and file2 are tracked but file3 is not
+	# there is no ref that begins with f
+	test_completion "git diff f" <<-\EOF &&
+	file1
+	file2
+	EOF
+	test_completion "git diff -- f" <<-\EOF
+	file1
+	file2
+	EOF
+'
+
+test_expect_success 'git diff [--] completes untracked paths, too' '
+	# ufile is not tracked and there is no ref that begins with u
+	test_completion "git diff u" <<-\EOF &&
+	ufile
+	EOF
+	test_completion "git diff -- u" <<-\EOF
+	ufile
+	EOF
+'
+
+test_expect_success 'git -C <path> diff completes paths in specified repo' '
+	test_when_finished "rm -rf repo-for-diff" &&
+	git init repo-for-diff &&
+	echo content >repo-for-diff/otherfile &&
+	echo content >repo-for-diff/lostfile &&
+	git -C repo-for-diff add otherfile &&
+	git -C repo-for-diff add lostfile &&
+	git -C repo-for-diff commit -m otherfile &&
+	echo untracked >repo-for-diff/oops &&
+	echo untracked >repo-for-diff/ufile &&
+	rm -f repo-for-diff/lostfile &&
+
+	test_completion "git -C repo-for-diff diff o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-diff diff l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-diff diff u" <<-\EOF &&
+	ufile
+	EOF
+
+	test_completion "git -C repo-for-diff diff -- o" <<-\EOF &&
+	otherfile
+	EOF
+	test_completion "git -C repo-for-diff diff -- l" <<-\EOF &&
+	lostfile
+	EOF
+	test_completion "git -C repo-for-diff diff -- u" <<-\EOF
+	ufile
+	EOF
+'
+
 test_expect_success 'show completes all refs' '
 	test_completion "git show m" <<-\EOF
 	main Z
@@ -2335,6 +2857,29 @@ test_expect_success 'complete tree filename with metacharacters' '
 	test_completion "git show HEAD:nam" <<-\EOF
 	name with ${meta}Z
 	name with spacesZ
+	EOF
+'
+
+test_expect_success 'symbolic-ref completes builtin options' '
+	test_completion "git symbolic-ref --d" <<-\EOF
+	--delete Z
+	EOF
+'
+
+test_expect_success 'symbolic-ref completes short ref names' '
+	test_completion "git symbolic-ref foo m" <<-\EOF
+	main Z
+	mybranch Z
+	mytag Z
+	EOF
+'
+
+test_expect_success 'symbolic-ref completes full ref names' '
+	test_completion "git symbolic-ref foo refs/" <<-\EOF
+	refs/heads/main Z
+	refs/heads/mybranch Z
+	refs/tags/mytag Z
+	refs/tags/A Z
 	EOF
 '
 
@@ -2539,36 +3084,94 @@ do
 	'
 done
 
-test_expect_success 'git config - section' '
-	test_completion "git config br" <<-\EOF
+test_expect_success 'git config subcommand' '
+	test_completion "git config " <<-\EOF
+	edit Z
+	get Z
+	list Z
+	remove-section Z
+	rename-section Z
+	set Z
+	unset Z
+	EOF
+'
+
+test_expect_success 'git config subcommand options' '
+	test_completion "git config get --show-" <<-\EOF
+	--show-names Z
+	--show-origin Z
+	--show-scope Z
+	EOF
+'
+
+test_expect_success 'git config get' '
+	test_when_finished "rm -f cfgfile" &&
+	git config set --file cfgfile foo.bar baz &&
+	test_completion "git config get --file cfgfile foo." <<-\EOF
+	foo.bar Z
+	EOF
+'
+
+test_expect_success 'git config set - section' '
+	test_completion "git config set br" <<-\EOF
 	branch.Z
 	browser.Z
 	EOF
 '
 
-test_expect_success 'git config - section include, includeIf' '
-	test_completion "git config inclu" <<-\EOF
+test_expect_success 'git config set - section include, includeIf' '
+	test_completion "git config set inclu" <<-\EOF
 	include.Z
 	includeIf.Z
 	EOF
 '
 
-test_expect_success 'git config - variable name' '
-	test_completion "git config log.d" <<-\EOF
+test_expect_success 'git config set - variable name' '
+	test_completion "git config set log.d" <<-\EOF
 	log.date Z
 	log.decorate Z
 	log.diffMerges Z
 	EOF
 '
 
-test_expect_success 'git config - variable name include' '
-	test_completion "git config include.p" <<-\EOF
+test_expect_success 'git config set - variable name include' '
+	test_completion "git config set include.p" <<-\EOF
 	include.path Z
 	EOF
 '
 
-test_expect_success 'git config - value' '
-	test_completion "git config color.pager " <<-\EOF
+test_expect_success 'setup for git config submodule tests' '
+	test_create_repo sub &&
+	test_commit -C sub initial &&
+	git submodule add ./sub
+'
+
+test_expect_success 'git config set - variable name - submodule and __git_compute_first_level_config_vars_for_section' '
+	test_completion "git config set submodule." <<-\EOF
+	submodule.active Z
+	submodule.alternateErrorStrategy Z
+	submodule.alternateLocation Z
+	submodule.fetchJobs Z
+	submodule.propagateBranches Z
+	submodule.recurse Z
+	submodule.sub.Z
+	EOF
+'
+
+test_expect_success 'git config set - variable name - __git_compute_second_level_config_vars_for_section' '
+	test_completion "git config set submodule.sub." <<-\EOF
+	submodule.sub.url Z
+	submodule.sub.update Z
+	submodule.sub.branch Z
+	submodule.sub.fetchRecurseSubmodules Z
+	submodule.sub.ignore Z
+	submodule.sub.active Z
+	submodule.sub.gitdir Z
+	EOF
+'
+
+test_expect_success 'git config set - value' '
+	test_completion "git config set color.pager " <<-\EOF
 	false Z
 	true Z
 	EOF
@@ -2616,6 +3219,73 @@ test_expect_success 'git clone --config= - value' '
 	false Z
 	true Z
 	EOF
+'
+
+test_expect_success 'git history subcommands' '
+	test_completion "git history " <<-\EOF &&
+	drop Z
+	fixup Z
+	reword Z
+	split Z
+	squash Z
+	EOF
+	test_completion "git history --" ""
+'
+
+test_expect_success 'git history subcommand options' '
+	test_completion "git history split main --" <<-\EOF &&
+	--update-refs=Z
+	--dry-run Z
+	--gpg-sign Z
+	--no-... Z
+	--no-dry-run Z
+	EOF
+	test_completion "git history fixup --upd" "--update-refs=" &&
+	test_completion "git history fixup --ree" "--reedit-message " &&
+	test_completion "git history split --upd" "--update-refs=" &&
+	test_completion "git history split main --dry" "--dry-run " &&
+	test_completion "git history reword main -- --d" "" &&
+	test_completion "git history fixup --empty=ke" "keep " &&
+	test_completion "git history fixup --empty=drop" "drop " &&
+	test_completion "git history drop --empty=ab" "abort " &&
+	test_completion "git history reword --empty=ke" "" &&
+	test_completion "git history fixup --update-refs=branch" "branches " &&
+	test_completion "git history split --update-refs=he" "head " &&
+	test_completion "git history reword main -- --update-refs=he" ""
+'
+
+test_expect_success 'git history revisions' '
+	test_completion "git history split ma" "main " &&
+	test_completion "git history split --update-refs=head ma" "main " &&
+	test_completion "git history fixup --empty=drop ma" "main " &&
+	test_completion "git history reword main m" ""
+'
+
+test_expect_success 'git history split pathspecs' '
+	test_completion "git history split main -- --update-refs=h" "" &&
+	test_completion "git history split main -- --update-refs h" "" &&
+	test_completion "git history split --dry-run main file" <<-\EOF &&
+	file1Z
+	file2Z
+	EOF
+	test_completion "git history split main -- file" <<-\EOF
+	file1Z
+	file2Z
+	EOF
+'
+
+test_expect_success 'git reflog show' '
+	test_when_finished "git checkout - && git branch -d shown" &&
+	git checkout -b shown &&
+	test_completion "git reflog sho" <<-\EOF &&
+	show Z
+	shown Z
+	EOF
+	test_completion "git reflog show sho" "shown " &&
+	test_completion "git reflog shown sho" "shown " &&
+	test_completion "git reflog --unt" "--until=" &&
+	test_completion "git reflog show --unt" "--until=" &&
+	test_completion "git reflog shown --unt" "--until="
 '
 
 test_expect_success 'options with value' '
@@ -2676,8 +3346,8 @@ test_expect_success 'plumbing commands are excluded without GIT_COMPLETION_SHOW_
 
 		# Just mainporcelain, not plumbing commands
 		run_completion "git c" &&
-		grep checkout out &&
-		! grep cat-file out
+		test_grep checkout out &&
+		test_grep ! cat-file out
 	)
 '
 
@@ -2690,13 +3360,13 @@ test_expect_success 'all commands are shown with GIT_COMPLETION_SHOW_ALL_COMMAND
 
 		# Both mainporcelain and plumbing commands
 		run_completion "git c" &&
-		grep checkout out &&
-		grep cat-file out &&
+		test_grep checkout out &&
+		test_grep cat-file out &&
 
 		# Check "gitk", a "main" command, but not a built-in + more plumbing
 		run_completion "git g" &&
-		grep gitk out &&
-		grep get-tar-commit-id out
+		test_grep gitk out &&
+		test_grep get-tar-commit-id out
 	)
 '
 
@@ -2718,6 +3388,33 @@ test_expect_success '__git_complete' '
 	__git_have_func __git_wrap_git_diff &&
 
 	test_must_fail __git_complete ga missing
+'
+
+test_expect_success '__git_pseudoref_exists' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		sane_unset __git_repo_path &&
+
+		# HEAD should exist, even if it points to an unborn branch.
+		__git_pseudoref_exists HEAD >output 2>&1 &&
+		test_must_be_empty output &&
+
+		# HEAD points to an existing branch, so it should exist.
+		test_commit A &&
+		__git_pseudoref_exists HEAD >output 2>&1 &&
+		test_must_be_empty output &&
+
+		# CHERRY_PICK_HEAD does not exist, so the existence check should fail.
+		! __git_pseudoref_exists CHERRY_PICK_HEAD >output 2>&1 &&
+		test_must_be_empty output &&
+
+		# CHERRY_PICK_HEAD points to a commit, so it should exist.
+		git update-ref CHERRY_PICK_HEAD A &&
+		__git_pseudoref_exists CHERRY_PICK_HEAD >output 2>&1 &&
+		test_must_be_empty output
+	)
 '
 
 test_done

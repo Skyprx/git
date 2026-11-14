@@ -50,15 +50,17 @@
 
 static VOLATILE_LIST_HEAD(tempfile_list);
 
-static void remove_template_directory(struct tempfile *tempfile,
+static int remove_template_directory(struct tempfile *tempfile,
 				      int in_signal_handler)
 {
 	if (tempfile->directory) {
 		if (in_signal_handler)
-			rmdir(tempfile->directory);
+			return rmdir(tempfile->directory);
 		else
-			rmdir_or_warn(tempfile->directory);
+			return rmdir_or_warn(tempfile->directory);
 	}
+
+	return 0;
 }
 
 static void remove_tempfiles(int in_signal_handler)
@@ -130,7 +132,8 @@ static void deactivate_tempfile(struct tempfile *tempfile)
 }
 
 /* Make sure errno contains a meaningful value on error */
-struct tempfile *create_tempfile_mode(const char *path, int mode)
+struct tempfile *repo_create_tempfile_mode(struct repository *r,
+					   const char *path, int mode)
 {
 	struct tempfile *tempfile = new_tempfile();
 
@@ -146,7 +149,7 @@ struct tempfile *create_tempfile_mode(const char *path, int mode)
 		return NULL;
 	}
 	activate_tempfile(tempfile);
-	if (adjust_shared_perm(tempfile->filename.buf)) {
+	if (adjust_shared_perm(r, tempfile->filename.buf)) {
 		int save_errno = errno;
 		error("cannot fix permission bits on %s", tempfile->filename.buf);
 		delete_tempfile(&tempfile);
@@ -353,16 +356,31 @@ int rename_tempfile(struct tempfile **tempfile_p, const char *path)
 	return 0;
 }
 
-void delete_tempfile(struct tempfile **tempfile_p)
+int delete_tempfile(struct tempfile **tempfile_p)
 {
 	struct tempfile *tempfile = *tempfile_p;
+	int err = 0;
 
 	if (!is_tempfile_active(tempfile))
-		return;
+		return 0;
 
-	close_tempfile_gently(tempfile);
-	unlink_or_warn(tempfile->filename.buf);
-	remove_template_directory(tempfile, 0);
+	err |= close_tempfile_gently(tempfile);
+	err |= unlink_or_warn(tempfile->filename.buf);
+	err |= remove_template_directory(tempfile, 0);
 	deactivate_tempfile(tempfile);
 	*tempfile_p = NULL;
+
+	return err ? -1 : 0;
+}
+
+void reassign_tempfile_ownership(pid_t from, pid_t to)
+{
+	volatile struct volatile_list_head *pos;
+
+	list_for_each(pos, &tempfile_list) {
+		struct tempfile *p = list_entry(pos, struct tempfile, list);
+
+		if (is_tempfile_active(p) && p->owner == from)
+			p->owner = to;
+	}
 }

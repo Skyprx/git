@@ -1,3 +1,5 @@
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "git-compat-util.h"
 #include "gettext.h"
 #include "hex-ll.h"
@@ -6,44 +8,55 @@
 #include "utf8.h"
 #include "date.h"
 
-int starts_with(const char *str, const char *prefix)
+bool starts_with(const char *str, const char *prefix)
 {
 	for (; ; str++, prefix++)
 		if (!*prefix)
-			return 1;
+			return true;
 		else if (*str != *prefix)
-			return 0;
+			return false;
 }
 
-int istarts_with(const char *str, const char *prefix)
+bool istarts_with(const char *str, const char *prefix)
 {
 	for (; ; str++, prefix++)
 		if (!*prefix)
-			return 1;
+			return true;
 		else if (tolower(*str) != tolower(*prefix))
-			return 0;
+			return false;
 }
 
-int skip_to_optional_arg_default(const char *str, const char *prefix,
+bool starts_with_mem(const char *str, size_t len, const char *prefix)
+{
+	const char *end = str + len;
+	for (; ; str++, prefix++) {
+		if (!*prefix)
+			return true;
+		else if (str == end || *str != *prefix)
+			return false;
+	}
+}
+
+bool skip_to_optional_arg_default(const char *str, const char *prefix,
 				 const char **arg, const char *def)
 {
 	const char *p;
 
 	if (!skip_prefix(str, prefix, &p))
-		return 0;
+		return false;
 
 	if (!*p) {
 		if (arg)
 			*arg = def;
-		return 1;
+		return true;
 	}
 
 	if (*p != '=')
-		return 0;
+		return false;
 
 	if (arg)
 		*arg = p + 1;
-	return 1;
+	return true;
 }
 
 /*
@@ -93,12 +106,10 @@ void strbuf_attach(struct strbuf *sb, void *buf, size_t len, size_t alloc)
 void strbuf_grow(struct strbuf *sb, size_t extra)
 {
 	int new_buf = !sb->alloc;
-	if (unsigned_add_overflows(extra, 1) ||
-	    unsigned_add_overflows(sb->len, extra + 1))
-		die("you want to use way too much memory");
+	size_t new_len = st_add3(sb->len, extra, 1);
 	if (new_buf)
 		sb->buf = NULL;
-	ALLOC_GROW(sb->buf, sb->len + extra + 1, sb->alloc);
+	ALLOC_GROW(sb->buf, new_len, sb->alloc);
 	if (new_buf)
 		sb->buf[0] = '\0';
 }
@@ -155,7 +166,7 @@ int strbuf_reencode(struct strbuf *sb, const char *from, const char *to)
 	if (!out)
 		return -1;
 
-	strbuf_attach(sb, out, len, len);
+	strbuf_attach(sb, out, len, len + 1);
 	return 0;
 }
 
@@ -266,7 +277,7 @@ void strbuf_vinsertf(struct strbuf *sb, size_t pos, const char *fmt, va_list ap)
 	len = vsnprintf(sb->buf + sb->len, 0, fmt, cp);
 	va_end(cp);
 	if (len < 0)
-		BUG("your vsnprintf is broken (returned %d)", len);
+		die(_("unable to format message: %s"), fmt);
 	if (!len)
 		return; /* nothing to do */
 	if (unsigned_add_overflows(sb->len, len))
@@ -300,6 +311,15 @@ void strbuf_add(struct strbuf *sb, const void *data, size_t len)
 	strbuf_grow(sb, len);
 	memcpy(sb->buf + sb->len, data, len);
 	strbuf_setlen(sb, sb->len + len);
+}
+
+void strbuf_addstrings(struct strbuf *sb, const char *s, size_t n)
+{
+	size_t len = strlen(s);
+
+	strbuf_grow(sb, st_mult(len, n));
+	for (size_t i = 0; i < n; i++)
+		strbuf_add(sb, s, len);
 }
 
 void strbuf_addbuf(struct strbuf *sb, const struct strbuf *sb2)
@@ -339,19 +359,30 @@ void strbuf_addf(struct strbuf *sb, const char *fmt, ...)
 	va_end(ap);
 }
 
+void strbuf_add_uint(struct strbuf *sb, uintmax_t value)
+{
+	char buf[DIV_ROUND_UP(bitsizeof(value) * 10, 33)];
+	char *end = buf + sizeof(buf);
+	char *p = end;
+
+	do
+		*--p = "0123456789"[value % 10];
+	while (value /= 10);
+	strbuf_add(sb, p, end - p);
+}
+
 static void add_lines(struct strbuf *out,
-			const char *prefix1,
-			const char *prefix2,
-			const char *buf, size_t size)
+			const char *prefix,
+			const char *buf, size_t size,
+			int space_after_prefix)
 {
 	while (size) {
-		const char *prefix;
 		const char *next = memchr(buf, '\n', size);
 		next = next ? (next + 1) : (buf + size);
 
-		prefix = ((prefix2 && (buf[0] == '\n' || buf[0] == '\t'))
-			  ? prefix2 : prefix1);
 		strbuf_addstr(out, prefix);
+		if (space_after_prefix && buf[0] != '\n' && buf[0] != '\t')
+			strbuf_addch(out, ' ');
 		strbuf_add(out, buf, next - buf);
 		size -= next - buf;
 		buf = next;
@@ -360,19 +391,12 @@ static void add_lines(struct strbuf *out,
 }
 
 void strbuf_add_commented_lines(struct strbuf *out, const char *buf,
-				size_t size, char comment_line_char)
+				size_t size, const char *comment_prefix)
 {
-	static char prefix1[3];
-	static char prefix2[2];
-
-	if (prefix1[0] != comment_line_char) {
-		xsnprintf(prefix1, sizeof(prefix1), "%c ", comment_line_char);
-		xsnprintf(prefix2, sizeof(prefix2), "%c", comment_line_char);
-	}
-	add_lines(out, prefix1, prefix2, buf, size);
+	add_lines(out, comment_prefix, buf, size, 1);
 }
 
-void strbuf_commented_addf(struct strbuf *sb, char comment_line_char,
+void strbuf_commented_addf(struct strbuf *sb, const char *comment_prefix,
 			   const char *fmt, ...)
 {
 	va_list params;
@@ -383,7 +407,7 @@ void strbuf_commented_addf(struct strbuf *sb, char comment_line_char,
 	strbuf_vaddf(&buf, fmt, params);
 	va_end(params);
 
-	strbuf_add_commented_lines(sb, buf.buf, buf.len, comment_line_char);
+	strbuf_add_commented_lines(sb, buf.buf, buf.len, comment_prefix);
 	if (incomplete_line)
 		sb->buf[--sb->len] = '\0';
 
@@ -401,7 +425,7 @@ void strbuf_vaddf(struct strbuf *sb, const char *fmt, va_list ap)
 	len = vsnprintf(sb->buf + sb->len, sb->alloc - sb->len, fmt, cp);
 	va_end(cp);
 	if (len < 0)
-		BUG("your vsnprintf is broken (returned %d)", len);
+		die(_("unable to format message: %s"), fmt);
 	if (len > strbuf_avail(sb)) {
 		strbuf_grow(sb, len);
 		len = vsnprintf(sb->buf + sb->len, sb->alloc - sb->len, fmt, ap);
@@ -442,6 +466,26 @@ size_t strbuf_expand_literal(struct strbuf *sb, const char *placeholder)
 	return 0;
 }
 
+void strbuf_expand_bad_format(const char *format, const char *command)
+{
+	const char *end;
+
+	if (*format != '(')
+		/* TRANSLATORS: The first %s is a command like "ls-tree". */
+		die(_("bad %s format: element '%s' does not start with '('"),
+		    command, format);
+
+	end = strchr(format + 1, ')');
+	if (!end)
+		/* TRANSLATORS: The first %s is a command like "ls-tree". */
+		die(_("bad %s format: element '%s' does not end in ')'"),
+		    command, format);
+
+	/* TRANSLATORS: %s is a command like "ls-tree". */
+	die(_("bad %s format: %%%.*s"),
+	    command, (int)(end - format + 1), format);
+}
+
 void strbuf_addbuf_percentquote(struct strbuf *dst, const struct strbuf *src)
 {
 	size_t i, len = src->len;
@@ -463,7 +507,9 @@ void strbuf_add_percentencode(struct strbuf *dst, const char *src, int flags)
 		unsigned char ch = src[i];
 		if (ch <= 0x1F || ch >= 0x7F ||
 		    (ch == '/' && (flags & STRBUF_ENCODE_SLASH)) ||
-		    strchr(URL_UNSAFE_CHARS, ch))
+		    ((flags & STRBUF_ENCODE_HOST_AND_PORT) ?
+		     !isalnum(ch) && !strchr("-.:[]", ch) :
+		     !!strchr(URL_UNSAFE_CHARS, ch)))
 			strbuf_addf(dst, "%%%02X", (unsigned char)ch);
 		else
 			strbuf_addch(dst, ch);
@@ -530,7 +576,7 @@ ssize_t strbuf_write(struct strbuf *sb, FILE *f)
 	return sb->len ? fwrite(sb->buf, 1, sb->len, f) : 0;
 }
 
-#define STRBUF_MAXLINK (2*PATH_MAX)
+#define STRBUF_MAXLINK (32767)
 
 int strbuf_readlink(struct strbuf *sb, const char *path, size_t hint)
 {
@@ -542,12 +588,12 @@ int strbuf_readlink(struct strbuf *sb, const char *path, size_t hint)
 	while (hint < STRBUF_MAXLINK) {
 		ssize_t len;
 
-		strbuf_grow(sb, hint);
-		len = readlink(path, sb->buf, hint);
+		strbuf_grow(sb, hint + 1);
+		len = readlink(path, sb->buf, hint + 1);
 		if (len < 0) {
 			if (errno != ERANGE)
 				break;
-		} else if (len < hint) {
+		} else if (len <= hint) {
 			strbuf_setlen(sb, len);
 			return 0;
 		}
@@ -599,8 +645,6 @@ int strbuf_getwholeline(struct strbuf *sb, FILE *fp, int term)
 
 	if (feof(fp))
 		return EOF;
-
-	strbuf_reset(sb);
 
 	/* Translate slopbuf to NULL, as we cannot call realloc on it */
 	if (!sb->alloc)
@@ -668,8 +712,10 @@ int strbuf_getwholeline(struct strbuf *sb, FILE *fp, int term)
 int strbuf_appendwholeline(struct strbuf *sb, FILE *fp, int term)
 {
 	struct strbuf line = STRBUF_INIT;
-	if (strbuf_getwholeline(&line, fp, term))
+	if (strbuf_getwholeline(&line, fp, term)) {
+		strbuf_release(&line);
 		return EOF;
+	}
 	strbuf_addbuf(sb, &line);
 	strbuf_release(&line);
 	return 0;
@@ -750,7 +796,7 @@ ssize_t strbuf_read_file(struct strbuf *sb, const char *path, size_t hint)
 void strbuf_add_lines(struct strbuf *out, const char *prefix,
 		      const char *buf, size_t size)
 {
-	add_lines(out, prefix, NULL, buf, size);
+	add_lines(out, prefix, buf, size, 0);
 }
 
 void strbuf_addstr_xml_quoted(struct strbuf *buf, const char *s)
@@ -798,45 +844,81 @@ void strbuf_addstr_urlencode(struct strbuf *sb, const char *s,
 	strbuf_add_urlencode(sb, s, strlen(s), allow_unencoded_fn);
 }
 
-static void strbuf_humanise(struct strbuf *buf, off_t bytes,
-				 int humanise_rate)
+void humanise_count(size_t count, char **value, const char **unit)
 {
-	if (bytes > 1 << 30) {
-		strbuf_addf(buf,
-				humanise_rate == 0 ?
-					/* TRANSLATORS: IEC 80000-13:2008 gibibyte */
-					_("%u.%2.2u GiB") :
-					/* TRANSLATORS: IEC 80000-13:2008 gibibyte/second */
-					_("%u.%2.2u GiB/s"),
-			    (unsigned)(bytes >> 30),
-			    (unsigned)(bytes & ((1 << 30) - 1)) / 10737419);
-	} else if (bytes > 1 << 20) {
-		unsigned x = bytes + 5243;  /* for rounding */
-		strbuf_addf(buf,
-				humanise_rate == 0 ?
-					/* TRANSLATORS: IEC 80000-13:2008 mebibyte */
-					_("%u.%2.2u MiB") :
-					/* TRANSLATORS: IEC 80000-13:2008 mebibyte/second */
-					_("%u.%2.2u MiB/s"),
-			    x >> 20, ((x & ((1 << 20) - 1)) * 100) >> 20);
-	} else if (bytes > 1 << 10) {
-		unsigned x = bytes + 5;  /* for rounding */
-		strbuf_addf(buf,
-				humanise_rate == 0 ?
-					/* TRANSLATORS: IEC 80000-13:2008 kibibyte */
-					_("%u.%2.2u KiB") :
-					/* TRANSLATORS: IEC 80000-13:2008 kibibyte/second */
-					_("%u.%2.2u KiB/s"),
-			    x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10);
+	if (count >= 1000000000) {
+		size_t x = count + 5000000; /* for rounding */
+		*value = xstrfmt(_("%u.%2.2u"), (unsigned)(x / 1000000000),
+				 (unsigned)(x % 1000000000 / 10000000));
+		/* TRANSLATORS: SI decimal prefix symbol for 10^9 */
+		*unit = _("G");
+	} else if (count >= 1000000) {
+		size_t x = count + 5000; /* for rounding */
+		*value = xstrfmt(_("%u.%2.2u"), (unsigned)(x / 1000000),
+				 (unsigned)(x % 1000000 / 10000));
+		/* TRANSLATORS: SI decimal prefix symbol for 10^6 */
+		*unit = _("M");
+	} else if (count >= 1000) {
+		size_t x = count + 5; /* for rounding */
+		*value = xstrfmt(_("%u.%2.2u"), (unsigned)(x / 1000),
+				 (unsigned)(x % 1000 / 10));
+		/* TRANSLATORS: SI decimal prefix symbol for 10^3 */
+		*unit = _("k");
 	} else {
-		strbuf_addf(buf,
-				humanise_rate == 0 ?
-					/* TRANSLATORS: IEC 80000-13:2008 byte */
-					Q_("%u byte", "%u bytes", bytes) :
-					/* TRANSLATORS: IEC 80000-13:2008 byte/second */
-					Q_("%u byte/s", "%u bytes/s", bytes),
-				(unsigned)bytes);
+		*value = xstrfmt("%u", (unsigned)count);
+		*unit = NULL;
 	}
+}
+
+void humanise_bytes(off_t bytes, char **value, const char **unit,
+		    unsigned flags)
+{
+	int humanise_rate = flags & HUMANISE_RATE;
+
+	if (bytes > 1 << 30) {
+		*value = xstrfmt(_("%u.%2.2u"), (unsigned)(bytes >> 30),
+				 (unsigned)(bytes & ((1 << 30) - 1)) / 10737419);
+		/* TRANSLATORS: IEC 80000-13:2008 gibibyte/second and gibibyte */
+		*unit = humanise_rate ? _("GiB/s") : _("GiB");
+	} else if (bytes > 1 << 20) {
+		unsigned x = bytes + 5243; /* for rounding */
+		*value = xstrfmt(_("%u.%2.2u"), x >> 20,
+				 ((x & ((1 << 20) - 1)) * 100) >> 20);
+		/* TRANSLATORS: IEC 80000-13:2008 mebibyte/second and mebibyte */
+		*unit = humanise_rate ? _("MiB/s") : _("MiB");
+	} else if (bytes > 1 << 10) {
+		unsigned x = bytes + 5; /* for rounding */
+		*value = xstrfmt(_("%u.%2.2u"), x >> 10,
+				 ((x & ((1 << 10) - 1)) * 100) >> 10);
+		/* TRANSLATORS: IEC 80000-13:2008 kibibyte/second and kibibyte */
+		*unit = humanise_rate ? _("KiB/s") : _("KiB");
+	} else {
+		*value = xstrfmt("%u", (unsigned)bytes);
+		if (flags & HUMANISE_COMPACT)
+			/* TRANSLATORS: IEC 80000-13:2008 byte/second and byte */
+			*unit = humanise_rate ? _("B/s") : _("B");
+		else
+			*unit = humanise_rate ?
+					/* TRANSLATORS: IEC 80000-13:2008 byte/second */
+					Q_("byte/s", "bytes/s", bytes) :
+					/* TRANSLATORS: IEC 80000-13:2008 byte */
+					Q_("byte", "bytes", bytes);
+	}
+}
+
+static void strbuf_humanise(struct strbuf *buf, off_t bytes, unsigned flags)
+{
+	char *value;
+	const char *unit;
+
+	humanise_bytes(bytes, &value, &unit, flags);
+
+	/*
+	 * TRANSLATORS: The first argument is the number string. The second
+	 * argument is the unit string (i.e. "12.34 MiB/s").
+	 */
+	strbuf_addf(buf, _("%s %s"), value, unit);
+	free(value);
 }
 
 void strbuf_humanise_bytes(struct strbuf *buf, off_t bytes)
@@ -846,7 +928,7 @@ void strbuf_humanise_bytes(struct strbuf *buf, off_t bytes)
 
 void strbuf_humanise_rate(struct strbuf *buf, off_t bytes)
 {
-	strbuf_humanise(buf, bytes, 1);
+	strbuf_humanise(buf, bytes, HUMANISE_RATE);
 }
 
 int printf_ln(const char *fmt, ...)
@@ -941,8 +1023,7 @@ void strbuf_addftime(struct strbuf *sb, const char *fmt, const struct tm *tm,
 		else if (skip_prefix(fmt, "s", &fmt))
 			strbuf_addf(&munged_fmt, "%"PRItime,
 				    (timestamp_t)tm_to_time_t(tm) -
-				    3600 * (tz_offset / 100) -
-				    60 * (tz_offset % 100));
+				    60 * tz_to_minutes(tz_offset));
 		else if (skip_prefix(fmt, "z", &fmt))
 			strbuf_addf(&munged_fmt, "%+05d", tz_offset);
 		else if (suppress_tz_name && skip_prefix(fmt, "Z", &fmt))
@@ -1005,10 +1086,10 @@ static size_t cleanup(char *line, size_t len)
  *
  * If last line does not have a newline at the end, one is added.
  *
- * Pass a non-NUL comment_line_char to skip every line starting
+ * Pass a non-NULL comment_prefix to skip every line starting
  * with it.
  */
-void strbuf_stripspace(struct strbuf *sb, char comment_line_char)
+void strbuf_stripspace(struct strbuf *sb, const char *comment_prefix)
 {
 	size_t empties = 0;
 	size_t i, j, len, newlen;
@@ -1021,8 +1102,8 @@ void strbuf_stripspace(struct strbuf *sb, char comment_line_char)
 		eol = memchr(sb->buf + i, '\n', sb->len - i);
 		len = eol ? eol - (sb->buf + i) + 1 : sb->len - i;
 
-		if (comment_line_char && len &&
-		    sb->buf[i] == comment_line_char) {
+		if (comment_prefix && len &&
+		    starts_with(sb->buf + i, comment_prefix)) {
 			newlen = 0;
 			continue;
 		}
@@ -1045,6 +1126,6 @@ void strbuf_stripspace(struct strbuf *sb, char comment_line_char)
 
 void strbuf_strip_file_from_path(struct strbuf *sb)
 {
-	char *path_sep = find_last_dir_sep(sb->buf);
+	const char *path_sep = find_last_dir_sep(sb->buf);
 	strbuf_setlen(sb, path_sep ? path_sep - sb->buf + 1 : 0);
 }

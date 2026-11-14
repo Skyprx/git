@@ -3,12 +3,15 @@
  *
  * Copyright (C) Linus Torvalds, 2005
  */
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+
 #include "config.h"
+#include "environment.h"
 #include "gettext.h"
 #include "hex.h"
 #include "object-name.h"
-#include "object-store-ll.h"
+#include "odb.h"
 #include "tree.h"
 #include "path.h"
 #include "quote.h"
@@ -23,20 +26,23 @@ static const char * const ls_tree_usage[] = {
 static void expand_objectsize(struct strbuf *line, const struct object_id *oid,
 			      const enum object_type type, unsigned int padded)
 {
+	static const char padding[] = "       ";
+	size_t min_len = padded ? strlen(padding) : 0;
+	size_t orig_len = line->len;
+	size_t len;
+
 	if (type == OBJ_BLOB) {
-		unsigned long size;
-		if (oid_object_info(the_repository, oid, &size) < 0)
+		size_t size;
+		if (odb_read_object_info(the_repository->objects, oid, &size) < 0)
 			die(_("could not get object info about '%s'"),
 			    oid_to_hex(oid));
-		if (padded)
-			strbuf_addf(line, "%7"PRIuMAX, (uintmax_t)size);
-		else
-			strbuf_addf(line, "%"PRIuMAX, (uintmax_t)size);
-	} else if (padded) {
-		strbuf_addf(line, "%7s", "-");
+		strbuf_add_uint(line, size);
 	} else {
 		strbuf_addstr(line, "-");
 	}
+	len = line->len - orig_len;
+	if (len < min_len)
+		strbuf_insert(line, orig_len, padding, min_len - len);
 }
 
 struct ls_tree_options {
@@ -100,19 +106,12 @@ static int show_tree_fmt(const struct object_id *oid, struct strbuf *base,
 		return 0;
 
 	while (strbuf_expand_step(&sb, &format)) {
-		const char *end;
 		size_t len;
 
 		if (skip_prefix(format, "%", &format))
 			strbuf_addch(&sb, '%');
 		else if ((len = strbuf_expand_literal(&sb, format)))
 			format += len;
-		else if (*format != '(')
-			die(_("bad ls-tree format: element '%s' "
-			      "does not start with '('"), format);
-		else if (!(end = strchr(format + 1, ')')))
-			die(_("bad ls-tree format: element '%s' "
-			      "does not end in ')'"), format);
 		else if (skip_prefix(format, "(objectmode)", &format))
 			strbuf_addf(&sb, "%06o", mode);
 		else if (skip_prefix(format, "(objecttype)", &format))
@@ -135,8 +134,7 @@ static int show_tree_fmt(const struct object_id *oid, struct strbuf *base,
 			strbuf_setlen(base, baselen);
 			strbuf_release(&sbuf);
 		} else
-			die(_("bad ls-tree format: %%%.*s"),
-			    (int)(end - format + 1), format);
+			strbuf_expand_bad_format(format, "ls-tree");
 	}
 	strbuf_addch(&sb, options->null_termination ? '\0' : '\n');
 	fwrite(sb.buf, sb.len, 1, stdout);
@@ -222,8 +220,8 @@ static int show_tree_long(const struct object_id *oid, struct strbuf *base,
 		return early;
 
 	if (type == OBJ_BLOB) {
-		unsigned long size;
-		if (oid_object_info(the_repository, oid, &size) == OBJ_BAD)
+		size_t size;
+		if (odb_read_object_info(the_repository->objects, oid, &size) == OBJ_BAD)
 			xsnprintf(size_text, sizeof(size_text), "BAD");
 		else
 			xsnprintf(size_text, sizeof(size_text),
@@ -337,7 +335,10 @@ static struct ls_tree_cmdmode_to_fmt ls_tree_cmdmode_format[] = {
 	},
 };
 
-int cmd_ls_tree(int argc, const char **argv, const char *prefix)
+int cmd_ls_tree(int argc,
+		const char **argv,
+		const char *prefix,
+		struct repository *repo UNUSED)
 {
 	struct object_id oid;
 	struct tree *tree;
@@ -377,7 +378,7 @@ int cmd_ls_tree(int argc, const char **argv, const char *prefix)
 	struct ls_tree_cmdmode_to_fmt *m2f = ls_tree_cmdmode_format;
 	int ret;
 
-	git_config(git_default_config, NULL);
+	repo_config(the_repository, git_default_config, NULL);
 
 	argc = parse_options(argc, argv, prefix, ls_tree_options,
 			     ls_tree_usage, 0);
@@ -406,7 +407,8 @@ int cmd_ls_tree(int argc, const char **argv, const char *prefix)
 			ls_tree_usage, ls_tree_options);
 	if (argc < 1)
 		usage_with_options(ls_tree_usage, ls_tree_options);
-	if (repo_get_oid(the_repository, argv[0], &oid))
+	if (repo_get_oid_with_flags(the_repository, argv[0], &oid,
+				    GET_OID_HASH_ANY))
 		die("Not a valid object name %s", argv[0]);
 
 	/*
@@ -422,7 +424,7 @@ int cmd_ls_tree(int argc, const char **argv, const char *prefix)
 	for (i = 0; i < options.pathspec.nr; i++)
 		options.pathspec.items[i].nowildcard_len = options.pathspec.items[i].len;
 	options.pathspec.has_wildcard = 0;
-	tree = parse_tree_indirect(&oid);
+	tree = repo_parse_tree_indirect(the_repository, &oid);
 	if (!tree)
 		die("not a tree object");
 	/*
